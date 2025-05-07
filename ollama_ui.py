@@ -6,6 +6,7 @@ from ollama_client import OllamaClient
 
 class OllamaApp:
     def __init__(self, root):
+        self.model_combobox = None
         self.chat_info_label = None
         self.root = root
         #self.root.set_theme("equilux")
@@ -49,6 +50,26 @@ class OllamaApp:
         label = ttk.Label(self.sidebar_frame, text="Conversations", font=("Arial", 12))
         label.pack(pady=10, padx=10, anchor='nw')
 
+
+        # Add a separator with a Close button on the bottom of the sidebar
+        button_frame = ttk.Frame(self.sidebar_frame, style='TFrame')
+        button_frame.pack(side='bottom', fill='x', padx=5, pady=5)
+
+        separator = ttk.Separator(button_frame, orient='horizontal')
+        separator.pack(fill='x', padx=5, pady=5)
+
+        button = ttk.Button(
+            button_frame,
+            text="Close",
+            command=self.root.destroy,
+            style='TButton',
+            width=10,
+            cursor="hand2"
+        )
+        button.pack(side='bottom', padx=5, pady=5)
+
+
+
     def populate_header(self):
         label = ttk.Label(self.header_frame, text="Select Model:", font=("Arial", 10))
         label.pack(side='left', padx=(10,5), pady=10)
@@ -69,7 +90,7 @@ class OllamaApp:
     def load_ollama_models_to_ui(self):
         try:
             model_names = self.ollama_client.get_models()
-
+            print(f"UI: Ollama models: {model_names}")
             if model_names:
                 self.model_combobox['values'] = model_names
                 if model_names:

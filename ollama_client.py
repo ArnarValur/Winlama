@@ -13,10 +13,15 @@ class OllamaClient:
         :return: List of model names
         """
         try:
-            response = requests.get(f"{self.base_url}/api/tags")
+            if not (self.base_url.startswith("http://") or self.base_url.startswith("https://")):
+                raise requests.exceptions.MissingSchema(f"URL scheme (http/https) is missing from base_url: {self.base_url}")
+            url = f"{self.base_url.rstrip('/')}/api/tags"
+
+            response = requests.get(url)
             response.raise_for_status()
             data = response.json()
             models = data.get('models', [])
+            #print(f"Models: {models}")
             model_names = [model['name'] for model in models]
             return model_names
         except requests.exceptions.ConnectionError as e:
