@@ -84,6 +84,10 @@ ENV/
 env.bak/
 venv.bak/
 
+# Obsidian dir
+.docs/
+
+
 # Logs
 *.log
 *.out

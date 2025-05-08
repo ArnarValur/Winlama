@@ -1,3 +1,4 @@
+# ollama_ui.py
 import tkinter as tk
 from tkinter import ttk
 from ttkthemes import ThemedTk
@@ -7,11 +8,6 @@ from ollama_client import OllamaClient
 class OllamaApp:
     def __init__(self, root):
         """ Initialize the Ollama UI. """
-        self.chat_info_label = None
-        self.prompt_input = None
-        self.chat_display = None
-        self.active_model_label = None
-        self.model_combobox = None
 
         self.root = root
         #self.root.set_theme("equilux")
@@ -23,6 +19,7 @@ class OllamaApp:
         self.ollama_client = OllamaClient()
         self.selected_model = tk.StringVar()
         self.current_chat_model_display = tk.StringVar()
+        self.current_conversation_context = None
 
         # -- Main Layout Frames --
 
@@ -37,11 +34,15 @@ class OllamaApp:
 
         # -- Populate Main Content Frame --
         # Header Frame
+        self.active_model_label = None
+        self.model_combobox = None
         self.header_frame = ttk.Frame(self.main_content_frame, height=50, style='TFrame')
         self.header_frame.pack(side='top', fill='x', padx=5, pady=5)
         self.header_frame.pack_propagate(False)
 
         # Chat Interface Frame
+        self.prompt_input = None
+        self.chat_display = None
         self.chat_interface_frame = ttk.Frame(self.main_content_frame, style='TFrame')
         self.chat_interface_frame.pack(side='top', fill='both', expand=True, padx=5, pady=5)
 
@@ -145,6 +146,7 @@ class OllamaApp:
             self.current_chat_model_display.set(f"Chatting with: {current_selection}")
         else:
             self.current_chat_model_display.set(current_selection or "[No model selected]")
+        self.current_conversation_context = None
         if hasattr(self, 'chat_display'):
             self.chat_display.config(state='normal')
             self.chat_display.delete('1.0', tk.END)
@@ -268,15 +270,38 @@ class OllamaApp:
         # Display user message
         self.display_message(f"You: {prompt_text}", "user")
         self.prompt_input.delete(0, tk.END)
-
-        # -- Placeholder for Ollama interaction --
-        # we will call self.ollama_client.generate_responses() here
+        self.prompt_input.config(state='disabled')
         self.display_message(f"Ollama ({selected_model_name}): Thinking...", "model_pending")
+        self.root.update_idletasks()
 
         # Simulate a delay and response for now
         # self.root.after(1000, lambda: self.display_message(f"Ollama ({selected_model_name}) response: {prompt_text}", "model_response"))
 
-        # TODO: Call OllamaClient to get actual response and display it.
+        try:
+            model_response_text, new_context = self.ollama_client.generate_response(
+                selected_model_name,
+                prompt_text,
+                context=self.current_conversation_context
+            )
+
+            self.current_chat_model_display = new_context
+
+            if model_response_text:
+                self.display_message(f"Ollama ({selected_model_name}): {model_response_text.strip()}", "model")
+            else:
+                self.display_message(f"Ollama ({selected_model_name}): Recieved no text in response.", "system")
+
+        except ConnectionError as e:
+            self.display_message(f"System: Connection error - {e}", "system")
+        except TimeoutError as e:
+            self.display_message(f"System: Timeout error - {e}", "system")
+        except ValueError as e:
+            self.display_message(f"System: Ollama error - {e}", "system")
+        except Exception as e:
+            self.display_message(f"System: An unexpected error occurred - {e}", "system")
+        finally:
+            self.prompt_input.config(state='normal')
+            self.prompt_input.focus_set()
 
 
 if __name__ == "__main__":
