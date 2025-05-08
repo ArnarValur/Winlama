@@ -1,7 +1,9 @@
 # ollama_ui.py
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 from ttkthemes import ThemedTk
+import threading
+import queue
 
 from ollama_client import OllamaClient
 
@@ -10,9 +12,9 @@ class OllamaApp:
         """ Initialize the Ollama UI. """
 
         self.root = root
-        #self.root.set_theme("equilux")
         self.root.title("Ollama UI")
         self.root.geometry('1000x700')
+        #self.root.set_theme("equilux")
         self.root.configure(bg='#2c2c2c')
 
         # Instantiate OllamaClient
@@ -21,8 +23,22 @@ class OllamaApp:
         self.current_chat_model_display = tk.StringVar()
         self.current_conversation_context = None
 
-        # -- Main Layout Frames --
+        # Thread for queuing messages
+        self.response_queue = queue.Queue()
 
+        # -- Initialize UI elements to None for clarity before they are created --
+        self.sidebar_frame = None
+        self.main_content_frame = None
+        self.header_frame = None
+        self.chat_interface_frame = None
+        self.model_combobox = None
+        self.active_model_label = None
+        self.chat_display = None
+        self.prompt_input = None
+        self.send_button = None
+
+
+        # -- Main Layout Frames --
         # Sidebar Frame Layout
         self.sidebar_frame = ttk.Frame(self.root, width=250, style='TFrame')
         self.sidebar_frame.pack(side='left', fill='y', padx=(5,0), pady=5)
@@ -34,15 +50,11 @@ class OllamaApp:
 
         # -- Populate Main Content Frame --
         # Header Frame
-        self.active_model_label = None
-        self.model_combobox = None
         self.header_frame = ttk.Frame(self.main_content_frame, height=50, style='TFrame')
         self.header_frame.pack(side='top', fill='x', padx=5, pady=5)
         self.header_frame.pack_propagate(False)
 
         # Chat Interface Frame
-        self.prompt_input = None
-        self.chat_display = None
         self.chat_interface_frame = ttk.Frame(self.main_content_frame, style='TFrame')
         self.chat_interface_frame.pack(side='top', fill='both', expand=True, padx=5, pady=5)
 
@@ -52,6 +64,9 @@ class OllamaApp:
         self.populate_chat_interface() # <- this will be updated
 
         self.load_ollama_models_to_ui()
+
+        # Check the queue
+        self.check_response_queue()
 
     def populate_sidebar(self):
         """ Populate the sidebar with a label and a combobox for selecting a model. """
@@ -138,23 +153,33 @@ class OllamaApp:
         self.on_model_selected()
 
     def on_model_selected(self, event=None):
-        """ Handle model selection and update the UI accordingly. """
-
+        """
+        Handle model selection and update the UI accordingly.
+        """
         current_selection = self.selected_model.get()
         print(f"Model selected in UI: {current_selection}")
         if current_selection and not current_selection.startswith("["):
             self.current_chat_model_display.set(f"Chatting with: {current_selection}")
         else:
             self.current_chat_model_display.set(current_selection or "[No model selected]")
+
         self.current_conversation_context = None
-        if hasattr(self, 'chat_display'):
+        # Clear pending responses
+        while not self.response_queue.empty():
+            try:
+                self.response_queue.get_nowait()
+            except queue.Empty:
+                continue
+
+        if hasattr(self, 'chat_display') and self.chat_display:
             self.chat_display.config(state='normal')
             self.chat_display.delete('1.0', tk.END)
             self.chat_display.config(state='disabled')
+        if hasattr(self, 'prompt_input') and self.prompt_input:
+            self.prompt_input.config(state='normal')
 
     def populate_chat_interface(self):
         """ Populate the chat interface with a chat display and input area. """
-
         # Frame for chat display and scrollbar
         chat_display_frame = ttk.Frame(self.chat_interface_frame)
         chat_display_frame.pack(
@@ -181,10 +206,8 @@ class OllamaApp:
         # ttk.Scrollbar
         scrollbar = ttk.Scrollbar(chat_display_frame, orient='vertical', command=self.chat_display.yview)
         self.chat_display['yscrollcommand'] = scrollbar.set
-
         scrollbar.pack(side='right', fill='y')
         self.chat_display.pack(side='left', fill='both', expand=True)
-
         self.setup_chat_tags()
 
         # -- Input Area --
@@ -194,10 +217,10 @@ class OllamaApp:
         self.prompt_input = ttk.Entry(input_frame, width=70, font=("Arial", 11))
         self.prompt_input.pack(side='left', fill='x', expand=True, padx=(5,0), ipady=5)
         # Bind Enter key to send_message
-        self.prompt_input.bind('<Return>', self.send_message)
+        self.prompt_input.bind('<Return>', self.send_message_threaded)
 
-        send_button = ttk.Button(input_frame, text="Send", command=self.send_message, style='Accent.TButton')
-        send_button.pack(side='right', padx=(0,5), pady=5)
+        self.send_button = ttk.Button(input_frame, text="Send", command=self.send_message_threaded, style='Accent.TButton')
+        self.send_button.pack(side='right', padx=(0,5), pady=5)
 
     def setup_chat_tags(self):
         """ Set up tags for different types of messages in the chat display. """
@@ -239,24 +262,58 @@ class OllamaApp:
                 lmargin1=10, lmargin2=10, rmargin=10
             )
 
+            # Error messages: left-aligned
+            self.chat_display.tag_configure(
+                "error",
+                foreground="#FF6B6B",
+                font=("Arial", 11, 'bold'),
+                justify="left",
+                lmargin1=10, lmargin2=10, rmargin=10
+            )
+
     def display_message(self, message, tag_name=None):
         """ Display a message in the chat display with an optional tag. """
-        if hasattr(self, 'chat_display') and self.chat_display:
-            self.chat_display.config(state='normal')
-            text_to_insert = message + "\n\n"
+        if not (hasattr(self, 'chat_display') and isinstance(self.chat_display, tk.Text)):
+            return
 
-            if tag_name:
-                self.chat_display.insert(tk.END, text_to_insert, tag_name)
-            else:
-                self.chat_display.insert(tk.END, text_to_insert)
+        self.chat_display.config(state='normal')
 
-            self.chat_display.see(tk.END)
-            self.chat_display.config(state='disabled')
+        # Model response, error or system
+        if tag_name in ['model', 'error', 'system']:
+            thinking_message_start_index = self.chat_display.search(
+                "Thinking...",
+                tk.END, # Stop index for backwards search (effectively start from the end)
+                "1.0",  # Start index for backwards search (effectively search up to the beginning)
+                backwards=True,
+                nocase=True, # Add this for robustness
+                count=tk.IntVar() # Necessary for backwards search
+            )
+
+            if thinking_message_start_index: # Check if the string was found
+                line_number = thinking_message_start_index.split('.')[0]
+                line_start_index = f"{line_number}.0"
+                tags_at_index = self.chat_display.tag_names(thinking_message_start_index)
+
+                if "model_pending" in tags_at_index:
+                    line_end_index = f"{line_start_index} +1 line"
+                    self.chat_display.delete(line_start_index, line_end_index)
+
+        # User message
+        text_to_insert = message + "\n\n"
+        if tag_name:
+            self.chat_display.insert(tk.END, text_to_insert, tag_name)
         else:
-            print("Chat display not initialized. Cannot display message.")
+            self.chat_display.insert(tk.END, text_to_insert)
 
-    def send_message(self, event=None):
-        """ Send a message to the Ollama server and display the response. """
+        self.chat_display.see(tk.END)
+        self.chat_display.config(state='disabled')
+
+    def send_message_threaded(self, event=None):
+        """
+        Handles UI changes and starts a new thread for Ollama communication.
+        :param event:
+        :return:
+        """
 
         prompt_text = self.prompt_input.get().strip()
         if not prompt_text:
@@ -267,44 +324,116 @@ class OllamaApp:
             self.display_message("System: Please select a model first.", "system")
             return
 
-        # Display user message
-        self.display_message(f"You: {prompt_text}", "user")
+        self.display_message(f"{prompt_text}", "user")
         self.prompt_input.delete(0, tk.END)
         self.prompt_input.config(state='disabled')
-        self.display_message(f"Ollama ({selected_model_name}): Thinking...", "model_pending")
+        self.send_button.config(state='disabled')
+        self.display_message(f"({selected_model_name}): Thinking...", "model_pending")
         self.root.update_idletasks()
 
-        # Simulate a delay and response for now
-        # self.root.after(1000, lambda: self.display_message(f"Ollama ({selected_model_name}) response: {prompt_text}", "model_response"))
+        # Create and start the worker thread
+        thread = threading.Thread(
+            target=self._send_message_worker,
+            args=(selected_model_name, prompt_text, self.current_conversation_context),
+            daemon=True
+        )
+        thread.start()
 
+    def _send_message_worker(self, model_name, prompt, context):
+        """
+        This function runs in a separate thread to call Ollama.
+        :param model_name:
+        :param prompt:
+        :param context:
+        :return:
+        """
         try:
             model_response_text, new_context = self.ollama_client.generate_response(
-                selected_model_name,
-                prompt_text,
-                context=self.current_conversation_context
+                model_name,
+                prompt,
+                context=context
             )
-
-            self.current_chat_model_display = new_context
-
-            if model_response_text:
-                self.display_message(f"Ollama ({selected_model_name}): {model_response_text.strip()}", "model")
-            else:
-                self.display_message(f"Ollama ({selected_model_name}): Recieved no text in response.", "system")
+            # Successful response and new context in the queue
+            self.response_queue.put({
+                'status': 'success',
+                'response': model_response_text,
+                'context': new_context,
+                'model_name': model_name
+            })
 
         except ConnectionError as e:
-            self.display_message(f"System: Connection error - {e}", "system")
+            self.response_queue.put({
+                'status': 'error',
+                'message': f"System: Connection error - {e}"
+            })
         except TimeoutError as e:
-            self.display_message(f"System: Timeout error - {e}", "system")
+            self.response_queue.put({
+                'status': 'error',
+                'message': f"System: Timeout error - {e}"
+            })
         except ValueError as e:
-            self.display_message(f"System: Ollama error - {e}", "system")
+            self.response_queue.put({
+                'status': 'error',
+                'message': f"System: Ollama error - {e}"
+            })
         except Exception as e:
-            self.display_message(f"System: An unexpected error occurred - {e}", "system")
+            self.response_queue.put({
+                'status': 'error',
+                'message': f"System: An unexpected error occurred - {e}"
+            })
+
+    def check_response_queue(self):
+        """
+        Periodically check the queue for messages from the worker thread.
+        :return:
+        """
+        try:
+            message_data = self.response_queue.get_nowait()
+
+            if hasattr(self, 'prompt_input') and self.prompt_input:
+                self.prompt_input.config(state='normal')
+            if hasattr(self, 'send_button') and self.send_button:
+                self.send_button.config(state='normal')
+            if hasattr(self, 'prompt_input') and self.prompt_input:
+                self.prompt_input.focus_set()
+
+            if message_data['status'] == 'success':
+                model_response_text = message_data['response']
+                self.current_conversation_context = message_data['context']
+                model_name = message_data['model_name']
+
+                if model_response_text:
+                    self.display_message(f"{model_name}: {model_response_text.strip()}", "model")
+                else:
+                    self.display_message(f"System: Received no text in response.", "system")
+
+            elif message_data['status'] == 'error':
+                self.display_message(message_data['message'], "error")
+
+        except queue.Empty:
+            pass
         finally:
-            self.prompt_input.config(state='normal')
-            self.prompt_input.focus_set()
+            self.root.after(100, self.check_response_queue)
 
 
 if __name__ == "__main__":
     main_window = ThemedTk(theme="equilux")
+
+    # Optional: Add custom ttk styles for better dark theme integration if needed
+    style = ttk.Style()
+    style.configure('TFrame', background='#2c2c2c')
+    style.configure('TLabel', background='#2c2c2c', foreground='#e0e0e0')
+    style.configure('TButton', background='#4a4a4a', foreground='#e0e0e0', borderwidth=1)
+    style.configure('Accent.TButton', background='#0078d4', foreground='white', borderwidth=1)  # Example accent
+    style.map('TButton', background=[('active', '#5a5a5a')])
+    style.map('Accent.TButton', background=[('active', '#005a9e')])
+    style.configure('TCombobox', fieldbackground='#3c3c3c', background='#4a4a4a', foreground='#e0e0e0',
+                    arrowcolor='white', borderwidth=0)
+    # For the Combobox dropdown list:
+    main_window.option_add('*TCombobox*Listbox.background', '#3c3c3c')
+    main_window.option_add('*TCombobox*Listbox.foreground', '#e0e0e0')
+    main_window.option_add('*TCombobox*Listbox.selectBackground', '#0078d4')
+    main_window.option_add('*TCombobox*Listbox.selectForeground', 'white')
+
     app = OllamaApp(main_window)
     main_window.mainloop()
