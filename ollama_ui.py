@@ -1,5 +1,6 @@
 # ollama_ui.py
 import tkinter as tk
+from itertools import accumulate
 from tkinter import ttk, messagebox
 from ttkthemes import ThemedTk
 import threading
@@ -22,9 +23,11 @@ class OllamaApp:
         self.selected_model = tk.StringVar()
         self.current_chat_model_display = tk.StringVar()
         self.current_conversation_context = None
-
+        self.active_stream_id = None
         # Thread for queuing messages
         self.response_queue = queue.Queue()
+
+        # Make sure on_model_selected also resets/cancels any active stream if a new model is chosen mid-stream (advanced)
 
         # -- Initialize UI elements to None for clarity before they are created --
         self.sidebar_frame = None
@@ -36,7 +39,7 @@ class OllamaApp:
         self.chat_display = None
         self.prompt_input = None
         self.send_button = None
-
+        self.current_stream_insert_mark = None
 
         # -- Main Layout Frames --
         # Sidebar Frame Layout
@@ -61,10 +64,8 @@ class OllamaApp:
         # -- Add Placeholder content --
         self.populate_sidebar()
         self.populate_header()
-        self.populate_chat_interface() # <- this will be updated
-
+        self.populate_chat_interface()
         self.load_ollama_models_to_ui()
-
         # Check the queue
         self.check_response_queue()
 
@@ -271,7 +272,7 @@ class OllamaApp:
                 lmargin1=10, lmargin2=10, rmargin=10
             )
 
-    def display_message(self, message, tag_name=None):
+    def display_message(self, message, tag_name=None, stream_chunk=False, is_first_chunk=False):
         """ Display a message in the chat display with an optional tag. """
         if not (hasattr(self, 'chat_display') and isinstance(self.chat_display, tk.Text)):
             return
@@ -279,7 +280,7 @@ class OllamaApp:
         self.chat_display.config(state='normal')
 
         # Model response, error or system
-        if tag_name in ['model', 'error', 'system']:
+        if is_first_chunk:
             thinking_message_start_index = self.chat_display.search(
                 "Thinking...",
                 tk.END, # Stop index for backwards search (effectively start from the end)
@@ -293,17 +294,26 @@ class OllamaApp:
                 line_number = thinking_message_start_index.split('.')[0]
                 line_start_index = f"{line_number}.0"
                 tags_at_index = self.chat_display.tag_names(thinking_message_start_index)
-
                 if "model_pending" in tags_at_index:
-                    line_end_index = f"{line_start_index} +1 line"
-                    self.chat_display.delete(line_start_index, line_end_index)
+                    self.chat_display.delete(f"{line_start_index}", f"{line_start_index} +1 line")
 
-        # User message
-        text_to_insert = message + "\n\n"
-        if tag_name:
-            self.chat_display.insert(tk.END, text_to_insert, tag_name)
+            self.root.update_idletasks()
+
+            # 3. Insert the first chunk (which already includes the "Ollama (model): " prefix from the worker)
+            # No extra newlines here yet, just the start of the stream.
+            self.chat_display.insert(tk.END, message, tag_name)
+            self.current_stream_insert_mark = self.chat_display.index(f"{tk.END}-1c")
+
+        elif stream_chunk and not is_first_chunk:
+            self.chat_display.insert(tk.END, message, tag_name)
+            self.current_stream_insert_mark = self.chat_display.index(f"{tk.END}-1c")
+
         else:
-            self.chat_display.insert(tk.END, text_to_insert)
+            text_to_insert = message + "\n\n"
+            if tag_name:
+                self.chat_display.insert(tk.END, text_to_insert, tag_name)
+            else:
+                self.chat_display.insert(tk.END, text_to_insert)
 
         self.chat_display.see(tk.END)
         self.chat_display.config(state='disabled')
@@ -314,7 +324,6 @@ class OllamaApp:
         :param event:
         :return:
         """
-
         prompt_text = self.prompt_input.get().strip()
         if not prompt_text:
             return
@@ -326,8 +335,10 @@ class OllamaApp:
 
         self.display_message(f"{prompt_text}", "user")
         self.prompt_input.delete(0, tk.END)
-        self.prompt_input.config(state='disabled')
-        self.send_button.config(state='disabled')
+
+        if hasattr(self, 'prompt_input'): self.prompt_input.config(state='disabled')
+        if hasattr(self, 'send_button'): self.send_button.config(state='disabled')
+
         self.display_message(f"({selected_model_name}): Thinking...", "model_pending")
         self.root.update_idletasks()
 
@@ -347,21 +358,53 @@ class OllamaApp:
         :param context:
         :return:
         """
+        is_first_chunk_for_ui = True
+        accumulate_response_for_prefix = ""
+
         try:
-            model_response_text, new_context = self.ollama_client.generate_response(
-                model_name,
-                prompt,
-                context=context
-            )
-            # Successful response and new context in the queue
+            for chunk_data in self.ollama_client.generate_response_stream(model_name, prompt, context=context):
+
+                if chunk_data.get('error'):
+                    self.response_queue.put({'type': 'stream_error', 'message': chunk_data['error'], 'model_name': model_name})
+                    return
+
+                token = chunk_data.get('response', '')
+                done = chunk_data.get('done', False)
+
+                if token:
+                    if is_first_chunk_for_ui:
+                        display_token = f"Ollama ({model_name}): {token}"
+                    else:
+                        display_token = token
+
+                    self.response_queue.put({
+                        'type': 'stream_chunk',
+                        'token': display_token,
+                        'model_name': model_name,
+                        'is_first_chunk_for_ui': is_first_chunk_for_ui
+                    })
+                    if is_first_chunk_for_ui:
+                        is_first_chunk_for_ui = False
+
+                if done:
+                    final_context = chunk_data.get('context')
+                    self.response_queue.put({
+                        'type': 'stream_done',
+                        'context': final_context,
+                        'model_name': model_name
+                        # 'full_response_data': chunk_data # Pass more if needed
+                    })
+                    return
+
+        except Exception as e:
+            print(f"UI Worker (_send_message_worker): Unhandled exception - {e}")
             self.response_queue.put({
-                'status': 'success',
-                'response': model_response_text,
-                'context': new_context,
+                'type': 'stream_error',
+                'message': f"Application error: {e}",
                 'model_name': model_name
             })
 
-        except ConnectionError as e:
+        """except ConnectionError as e:
             self.response_queue.put({
                 'status': 'error',
                 'message': f"System: Connection error - {e}"
@@ -380,7 +423,7 @@ class OllamaApp:
             self.response_queue.put({
                 'status': 'error',
                 'message': f"System: An unexpected error occurred - {e}"
-            })
+            })"""
 
     def check_response_queue(self):
         """
@@ -389,26 +432,52 @@ class OllamaApp:
         """
         try:
             message_data = self.response_queue.get_nowait()
+            msg_type = message_data.get('type')
+            model_name = message_data.get('model_name', self.selected_model.get())
 
-            if hasattr(self, 'prompt_input') and self.prompt_input:
-                self.prompt_input.config(state='normal')
-            if hasattr(self, 'send_button') and self.send_button:
-                self.send_button.config(state='normal')
-            if hasattr(self, 'prompt_input') and self.prompt_input:
-                self.prompt_input.focus_set()
+            if msg_type == 'stream_chunk':
+                self.display_message(
+                    message_data['token'],
+                    tag_name='model',
+                    stream_chunk=True,
+                    is_first_chunk=message_data.get('is_first_chunk_for_ui', False)
+                )
+            elif msg_type == 'stream_done':
+                self.current_conversation_context = message_data.get('context')
+                if hasattr(self, 'chat_display') and self.chat_display:
+                    self.chat_display.config(state='normal')
+                    self.chat_display.insert(tk.END, "\n\n")
+                    self.chat_display.see(tk.END)
+                    self.chat_display.config(state='disabled')
 
-            if message_data['status'] == 'success':
-                model_response_text = message_data['response']
-                self.current_conversation_context = message_data['context']
-                model_name = message_data['model_name']
+                if hasattr(self, 'prompt_input'): self.prompt_input.config(state='normal')
+                if hasattr(self, 'send_button'): self.send_button.config(state='normal')
+                if hasattr(self, 'prompt_input'): self.prompt_input.focus_set()
 
-                if model_response_text:
-                    self.display_message(f"{model_name}: {model_response_text.strip()}", "model")
-                else:
-                    self.display_message(f"System: Received no text in response.", "system")
+            elif msg_type == 'stream_error':
+                if hasattr(self, 'chat_display') and self.chat_display:
+                    self.chat_display.config(state='normal')
+                    thinking_message_start_index = self.chat_display.search(
+                        "Thinking...",
+                        tk.END,
+                        "1.0",
+                        backwards=True,
+                        nocase=True,
+                        count=tk.IntVar()
+                    )
+                    if thinking_message_start_index:
+                        line_number = thinking_message_start_index.split('.')[0]
+                        line_start_index = f"{line_number}.0"
+                        tags_at_index = self.chat_display.tag_names(thinking_message_start_index)
+                        if 'model_pending' in tags_at_index:
+                            self.chat_display.delete(f"{line_start_index}", f"{line_start_index} +1 line")
+                    self.chat_display.config(state='disabled')
 
-            elif message_data['status'] == 'error':
-                self.display_message(message_data['message'], "error")
+                self.display_message(f"Error from {model_name}: {message_data['message']}", "error")
+
+                if hasattr(self, 'prompt_input'): self.prompt_input.config(state='normal')
+                if hasattr(self, 'send_button'): self.send_button.config(state='normal')
+                if hasattr(self, 'prompt_input'): self.prompt_input.focus_set()
 
         except queue.Empty:
             pass
@@ -418,22 +487,5 @@ class OllamaApp:
 
 if __name__ == "__main__":
     main_window = ThemedTk(theme="equilux")
-
-    # Optional: Add custom ttk styles for better dark theme integration if needed
-    style = ttk.Style()
-    style.configure('TFrame', background='#2c2c2c')
-    style.configure('TLabel', background='#2c2c2c', foreground='#e0e0e0')
-    style.configure('TButton', background='#4a4a4a', foreground='#e0e0e0', borderwidth=1)
-    style.configure('Accent.TButton', background='#0078d4', foreground='white', borderwidth=1)  # Example accent
-    style.map('TButton', background=[('active', '#5a5a5a')])
-    style.map('Accent.TButton', background=[('active', '#005a9e')])
-    style.configure('TCombobox', fieldbackground='#3c3c3c', background='#4a4a4a', foreground='#e0e0e0',
-                    arrowcolor='white', borderwidth=0)
-    # For the Combobox dropdown list:
-    main_window.option_add('*TCombobox*Listbox.background', '#3c3c3c')
-    main_window.option_add('*TCombobox*Listbox.foreground', '#e0e0e0')
-    main_window.option_add('*TCombobox*Listbox.selectBackground', '#0078d4')
-    main_window.option_add('*TCombobox*Listbox.selectForeground', 'white')
-
     app = OllamaApp(main_window)
     main_window.mainloop()

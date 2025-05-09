@@ -33,6 +33,9 @@ class OllamaClient:
         except requests.exceptions.ConnectionError as e:
             print(f"OllamaClient: Connection error in get_models - {e}")
             raise ConnectionError("Failed to connect to Ollama server while fetching models.") from e
+        except requests.exceptions.Timeout as e:
+            print(f"OllamaClient: Timeout error in get_models - {e}")
+            raise TimeoutError("Request to Ollama timed out while fetching models.") from e
         except requests.exceptions.HTTPError as e:
             print(f"OllamaClient: HTTP error in get_models - {e.response.status_code} - {e.response.text}")
             raise ValueError(f"HTTP error {e.response.status_code} from Ollama server while fetching models") from e
@@ -43,62 +46,61 @@ class OllamaClient:
             print(f"OllamaClient: An unexpected error occurred in get_models - {e}")
             raise Exception("An unexpected error occurred while fetching models.") from e
 
-    def generate_response(self, model_name, prompt, stream=False, context=None):
-        """ Generate a response from the Ollama server using the specified model.
+    def generate_response_stream(self, model_name, prompt, context=None):
+        """ Generate a response from the Ollama server using the specified model, yielding parts of the response.
         Args:
             :param model_name: The name of the model to use for generation.
             :param prompt: The input prompt for the model.
-            :param stream: Whether to stream the response. Defaults to False.
-            :param context: Additional context for the model. Defaults to None.
-            :return: The generated response.
+            :param context: Previous conversation context (list of integers).
+        Yields:
+            dict: Parsed JSON objects from the Ollama stream.
+                Each object typically contains 'response' (a token/chunk of text)
+                and 'done' (boolean). The final object when done=true will
+                contain the full context and other summary info.
         """
-        if stream:
-            # TODO: Implement streaming response
-            raise NotImplementedError("Streaming responses are not implemented yet.")
-
         try:
             url = f"{self.base_url.rstrip('/')}/api/generate"
             payload = {
                 'model': model_name,
                 'prompt': prompt,
-                'stream': False
+                'stream': True
             }
             if context: # Ollama docs say context will be deprecated, find out why and other solution?
                 payload['context'] = context
 
             print(f"OllamaClient: Sending payload to {url}: {{payload}}")
 
-            # Timeout for requests
-            response = requests.post(url, json=payload, timeout=120)
-            response.raise_for_status()
-            # The response from /api/generate when steam is False is a single Json object.
-            response_data = response.json()
-            print(f"OllamaClient: Response from server: {response_data}") # Debugging
+            with requests.post(url, json=payload, stream=True, timeout=300) as response:
+                response.raise_for_status()
 
-            # The text response is in the "response" key, it also returns a "context" for a follow-up messages.
-            return response_data.get("response", ""), response_data.get("context")
+                for line in response.iter_lines():
+                    if line:
+                        try:
+                            json_line = line.decode('utf-8')
+                            chunk = json.loads(json_line)
+                            yield chunk
+                        except json.JSONDecodeError as e:
+                            print(f"OllamaClient: Json decoding error for a stream line: '{json_line}' - {e}")
+                            continue
+                        except Exception as e:
+                            print(f"OllamaClient: Error processing stream line: '{line}' - {e}")
+                            continue
 
         except requests.exceptions.ConnectionError as e:
             print(f"OllamaClient: Connection error in generate_response - {e}")
-            raise ConnectionError("Failed to connect to Ollama server for response generation.") from e
+            yield {'error': "Connection error", 'done': True}
         except requests.exceptions.Timeout as e:
             print(f"OllamaClient: Timeout error in generate_response - {e}")
-            raise TimeoutError("Request to Ollama times out.") from e
+            yield {'error': "Timeout error", 'done': True}
         except requests.exceptions.HTTPError as e:
-            print(f"OllamaClient: HTTP error in generate_response - {e.response.status_code} - {e.response.text}")
-            # Debug inspection:
             error_message = f"Http error {e.response.status_code} from Ollama server"
             try:
-                ollama_error = e.response.json().get('error')
-                if ollama_error:
-                    error_message += f": Details: {ollama_error}"
+                ollama_error_detail = e.response.json().get('error', e.response.text)
+                error_message += f": Details: {ollama_error_detail}"
             except json.JSONDecodeError:
-                pass
-            raise ValueError(error_message) from e
-        except json.JSONDecodeError as e:
-            print(f"OllamaClient: JSON decoding error in generate_response - {e}")
-            print(f"OllamaClient: Raw response from server: {response.text}")
-            raise ValueError("Failed to decode JSON response from Ollama during generation.") from e
+                error_message += f": Details: {e.response.text}"
+            print(f"OllamaClient: HTTP error in generate_response_stream - {error_message}")
+            yield {'error': error_message, 'done': True}
         except Exception as e:
             print(f"OllamaClient: An unexpected error occurred in generate_response - {e}")
-            raise Exception("An unexpected error occurred while generating response.") from e
+            yield {'error': f"Unexpected Error: {e}, 'done': True"}
